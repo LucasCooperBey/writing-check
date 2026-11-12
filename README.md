@@ -9,9 +9,34 @@ curl -fsSL -o writing_check.py https://raw.githubusercontent.com/LucasCooperBey/
 python3 writing_check.py draft.md
 ```
 
-Add --max 15 when you want a failing exit code once the weighted rate goes over 15 hits per 1,000 words. Leave the max off when you only want the report.
+Add --max 15 when you want a failing exit code once the weighted rate goes over 15 hits per 1,000 words. A draft under 80 words still prints its rate, and --max does not fail that draft. Leave the max off when you only want the report.
 
-Score a markdown file, a text file, or an HTML file with the tags stripped by passing the path. `--stdin` reads the draft from the terminal, and `--transcript FILE.jsonl --last N` scores the last N assistant turns in a Claude Code transcript. `--quiet` prints one summary line per input. `--json` prints the rule id, the weight, the line, and an excerpt for each hit, plus totals. `--words warn` is the default and lists the soft words at weight 0, while `--words off` hides that list. `--rewrite-prompt` prints a prompt you can paste into any chat model and then exits 0. Exit codes are 0 when the draft is under the max or when no max is set, 1 when the rate exceeds the max, and 2 when the arguments are wrong, which keeps a bad call from looking like a clean draft.
+Score a markdown file, a text file, or an HTML file with the tags stripped by passing the path. `--stdin` reads the draft from the terminal, and `--transcript FILE.jsonl --last N` scores the last N assistant turns in a Claude Code transcript. `--quiet` prints one summary line per input. `--json` prints the rule id, the weight, the line, and an excerpt for each hit, plus totals. `--words warn` is the default and lists the soft words at weight 0, while `--words off` hides that list. `--rewrite-prompt` prints a prompt you can paste into any chat model and then exits 0. Exit codes are 0 when the draft is under the max, under 80 words, or when no max is set, 1 when the rate exceeds the max, 2 when the arguments are wrong, and 3 when the checker could not run, which keeps a bad call from looking like a clean draft.
+
+## Example
+
+`examples/before.md` is a 237-word bakery announcement written with the shapes this tool looks for, and `examples/after.md` gives the same news without them. The first lines of the report on the first file:
+
+```
+$ python3 writing_check.py examples/before.md
+[PERFORMED] 164.6/1k   35 hits    237 words  examples/before.md
+    filler      x1   (filler intensifiers, weight 2)
+       - filler intensifier: Genuinely
+    antithesis  x2   (manufactured antithesis, weight 3)
+       - 'X, not Y' closer: The page is a promise, not a form.
+       - verbless ', not Y' fragment: Orders close at 6 PM the day before, not later.
+    aphorism    x1   (aphorism formulas, weight 3)
+       - aphorism 'X is the Y of Z': It is the architecture of a calm pickup.
+```
+
+The rewrite scores clean, so `--max 15` exits 0 on it and exits 1 on the draft:
+
+```
+$ python3 writing_check.py examples/after.md --max 15
+[CLEAN    ]   0.0/1k    0 hits    197 words  examples/after.md
+```
+
+A clean score means none of these shapes were found. It does not mean the claims in the draft are true or that it sounds like you.
 
 ## Rules
 
@@ -108,7 +133,7 @@ A Stop hook can run the checker on the last assistant turn. When the rate is ove
 
 ## Git pre-commit hook
 
-The pre-commit hook scores staged `.md` and `.txt` files with the same max. Copy `hooks/pre-commit` to `.git/hooks/pre-commit` and mark that copy executable. When no staged file is markdown or text, the hook reports that it had no work and exits 0. `WRITING_CHECK_MAX` overrides the default of 15 for that run too.
+The pre-commit hook scores staged `.md` and `.txt` files with the same max. Copy `hooks/pre-commit` to `.git/hooks/pre-commit` and mark that copy executable. It reads the checker from `$WRITING_CHECK` when that is set, otherwise from `writing_check.py` next to the hook's real location, otherwise from the repo top level, otherwise from `PATH`. When no staged file is markdown or text, the hook reports that it had no work and exits 0. `WRITING_CHECK_MAX` overrides the default of 15 for that run too.
 
 ## Limits
 

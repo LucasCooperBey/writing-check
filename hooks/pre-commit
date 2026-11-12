@@ -1,10 +1,15 @@
 #!/bin/sh
-# Score staged markdown and text files.
+# Score the staged blobs of markdown and text files, not the working tree.
 # did the work: the checker ran on staged .md and .txt files.
 # had no work: no staged file of those types.
-# could not do it: git or the checker is missing.
+# could not do it: git is missing, or the checker could not be found.
 
 set -eu
+
+case $0 in
+  /*) hook_arg=$0 ;;
+  *) hook_arg="$(pwd)/$0" ;;
+esac
 
 if ! command -v git >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
   echo "writing-check: could not do it" >&2
@@ -19,34 +24,68 @@ cd "$root" || {
   echo "writing-check: could not do it" >&2
   exit 0
 }
-check="$root/writing_check.py"
-if [ ! -f "$check" ]; then
+
+if [ -n "${WRITING_CHECK:-}" ] && [ -f "$WRITING_CHECK" ]; then
+  check=$WRITING_CHECK
+elif [ -n "${WRITING_CHECK:-}" ]; then
+  echo "writing-check: could not do it (checker not found)" >&2
+  exit 0
+else
+  hook_real=$(python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$hook_arg") || {
+    echo "writing-check: could not do it" >&2
+    exit 0
+  }
+  hook_dir=$(dirname -- "$hook_real")
+  if [ -f "$hook_dir/writing_check.py" ]; then
+    check=$hook_dir/writing_check.py
+  elif [ -f "$root/writing_check.py" ]; then
+    check=$root/writing_check.py
+  else
+    check=$(command -v writing_check.py 2>/dev/null || true)
+    if [ -z "$check" ] || [ ! -f "$check" ]; then
+      echo "writing-check: could not do it (checker not found)" >&2
+      exit 0
+    fi
+  fi
+fi
+
+list_file=$(mktemp "${TMPDIR:-/tmp}/writing-check.XXXXXX")
+trap 'rm -f "$list_file"' EXIT
+lines_file=$(mktemp "${TMPDIR:-/tmp}/writing-check.XXXXXX")
+trap 'rm -f "$list_file" "$lines_file"' EXIT
+
+git diff --cached --name-only -z --diff-filter=ACM > "$list_file" || {
   echo "writing-check: could not do it" >&2
   exit 0
-fi
+}
+tr '\0' '\n' < "$list_file" > "$lines_file"
 
-list=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(md|txt)$' || true)
-if [ -z "$list" ]; then
-  echo "writing-check: had no work" >&2
-  exit 0
-fi
-
-set --
-set -f
-IFS='
-'
-for f in $list; do
-  [ -n "$f" ] || continue
-  set -- "$@" "$f"
-done
-unset IFS
-set +f
-
-if [ "$#" -eq 0 ]; then
-  echo "writing-check: had no work" >&2
-  exit 0
-fi
-
-echo "writing-check: did the work" >&2
+scored=0
+fail=0
 max=${WRITING_CHECK_MAX:-15}
-python3 "$check" --max "$max" -- "$@"
+while IFS= read -r path || [ -n "$path" ]; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.md|*.txt) ;;
+    *) continue ;;
+  esac
+  if [ "$scored" -eq 0 ]; then
+    echo "writing-check: did the work" >&2
+  fi
+  scored=1
+  set +e
+  git show ":$path" | python3 "$check" --max "$max" --stdin --label="$path"
+  status=$?
+  set -e
+  if [ "$status" -eq 1 ]; then
+    fail=1
+  elif [ "$status" -ne 0 ]; then
+    exit "$status"
+  fi
+done < "$lines_file"
+
+if [ "$scored" -eq 0 ]; then
+  echo "writing-check: had no work" >&2
+  exit 0
+fi
+exit "$fail"

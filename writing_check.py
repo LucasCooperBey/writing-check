@@ -24,9 +24,18 @@ import os
 import re
 import sys
 
+# A short draft still prints a rate. --max does not fail it.
+MIN_WORDS = 80
+
 SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _WORD_RE = re.compile(r"[A-Za-z'\u2019]+")
-_DASH_RE = re.compile(".{0,28}([\u2014\u2013]).{0,28}")
+_DASH_RE = re.compile("[\u2014\u2013]")
+_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_INLINE_RE = re.compile(r"`[^`]*`")
+_QUOTE_RE = re.compile(r"^\s*>.*$", re.M)
+_TABLE_RE = re.compile(r"^\s*[|+].*$", re.M)
+_URL_RE = re.compile(r"https?://\S+")
+_PROSE_RES = (_FENCE_RE, _INLINE_RE, _QUOTE_RE, _TABLE_RE, _URL_RE)
 
 # A heading or a bullet with no terminal punctuation would let one sentence run
 # across blocks. Antithesis and tailing negation read one block at a time.
@@ -114,6 +123,12 @@ _NAME_SKIP = {
     "I", "We", "They", "He", "She", "It", "This", "That", "These", "Those",
     "There", "My", "Our", "The", "A", "An", "And", "But", "Or", "For", "Of",
 }
+# A sentence-initial capital is not a source when the name is only one of these.
+_COMMON_NOUN_OPENERS = {
+    "Experts", "Users", "Studies", "Researchers", "People", "Developers",
+    "Customers", "Teams", "Companies", "Analysts", "Reports", "Surveys",
+    "Scientists",
+}
 _HEDGE_RES = (
     re.compile(r"\bto some extent\b", re.I),
     re.compile(r"\bit seems\b", re.I),
@@ -141,11 +156,62 @@ _WORD_RES = tuple((phrase, _phrase_re(phrase)) for phrase in SOFT_WORDS)
 
 def _claim_text(text):
     """Drop code, quotes, and tables. Keep links so a citation can still count."""
-    t = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    t = re.sub(r"`[^`]*`", " ", t)
-    t = re.sub(r"^\s*>.*$", " ", t, flags=re.M)
-    t = re.sub(r"^\s*[|+].*$", " ", t, flags=re.M)
-    return t
+    for pattern in (_FENCE_RE, _INLINE_RE, _QUOTE_RE, _TABLE_RE):
+        text = pattern.sub(" ", text)
+    return text
+
+
+def _sub_mapped(text, index_map, pattern):
+    parts = []
+    mapped = []
+    pos = 0
+    for match in pattern.finditer(text):
+        parts.append(text[pos:match.start()])
+        mapped.extend(index_map[pos:match.start()])
+        parts.append(" ")
+        mapped.append(None)
+        pos = match.end()
+    parts.append(text[pos:])
+    mapped.extend(index_map[pos:])
+    return "".join(parts), mapped
+
+
+def _prose_with_map(text):
+    """Return the word-count prose and each index's original position.
+
+    Dash, signpost, and inline-header rules scan this prose, so a hit inside
+    code, a quote, a table, or a URL does not count. The map puts the line
+    number back in the original draft. A space inserted for a removed span
+    has no original index.
+    """
+    index_map = list(range(len(text)))
+    current = text
+    for pattern in _PROSE_RES:
+        current, index_map = _sub_mapped(current, index_map, pattern)
+    return current, index_map
+
+
+def _map_offset(index_map, prose_index):
+    if not index_map:
+        return 0
+    if prose_index < 0:
+        prose_index = 0
+    if prose_index >= len(index_map):
+        prose_index = len(index_map) - 1
+    mapped = index_map[prose_index]
+    if mapped is not None:
+        return mapped
+    left = prose_index - 1
+    while left >= 0:
+        if index_map[left] is not None:
+            return index_map[left]
+        left -= 1
+    right = prose_index + 1
+    while right < len(index_map):
+        if index_map[right] is not None:
+            return index_map[right]
+        right += 1
+    return 0
 
 
 def _quoted_stripped(text):
@@ -157,7 +223,8 @@ def _quoted_stripped(text):
     inflate the word count. The unsourced-number rule uses _claim_text instead,
     because it has to see the link.
     """
-    return re.sub(r"https?://\S+", " ", _claim_text(text))
+    prose, _index_map = _prose_with_map(text)
+    return prose
 
 
 def _sentences(text):
@@ -179,17 +246,20 @@ def _one_line(s):
     return " ".join((s or "").split())
 
 
-def _hit(detail, excerpt, anchor=None, sentence=None):
+def _hit(detail, excerpt, anchor=None, sentence=None, offset=None):
     shown = _one_line(excerpt)
     if len(shown) > 180:
         shown = shown[:177] + "..."
     sent = _one_line(sentence if sentence is not None else excerpt)
-    return {
+    item = {
         "detail": detail,
         "excerpt": shown,
         "sentence": sent,
         "anchor": anchor if anchor is not None else (excerpt or shown),
     }
+    if isinstance(offset, int) and not isinstance(offset, bool):
+        item["offset"] = offset
+    return item
 
 
 def _sentence_containing(text, fragment):
@@ -210,7 +280,13 @@ def _sentence_containing(text, fragment):
     return _one_line(text[left:right])
 
 
-def _line_of(text, fragment):
+def _line_of(text, fragment, offset=None):
+    if isinstance(offset, int) and not isinstance(offset, bool):
+        if offset < 0:
+            return 1
+        if offset > len(text):
+            offset = len(text)
+        return text.count("\n", 0, offset) + 1
     if not fragment:
         return 1
     idx = text.find(fragment)
@@ -221,20 +297,41 @@ def _line_of(text, fragment):
     return text.count("\n", 0, idx) + 1
 
 
+def _en_dash_skip(text, index):
+    """A numeric range or a code-span range is typography, not a prose dash."""
+    if re.search(r"\d ?$", text[max(0, index - 3):index]):
+        return True
+    if text[max(0, index - 1):index] == "`" and text[index + 1:index + 2] == "`":
+        return True
+    return False
+
+
+def _dash_window(prose, start, end):
+    line_start = prose.rfind("\n", 0, start) + 1
+    line_end = prose.find("\n", start)
+    if line_end < 0:
+        line_end = len(prose)
+    left = max(line_start, start - 28)
+    right = min(line_end, end + 28)
+    return prose[left:right]
+
+
 def r_dash(text):
+    prose, index_map = _prose_with_map(text)
     out = []
-    for m in _DASH_RE.finditer(text):
-        if m.group(1) == "\u2013":
-            # An en dash that joins a numeric or date range is typography.
-            i = m.start(1)
-            if re.search(r"\d ?$", text[max(0, i - 3):i]):
-                continue
-            # An en dash between two inline code spans is an identifier range.
-            if text[max(0, i - 1):i] == "`" and text[i + 1:i + 2] == "`":
-                continue
-        window = m.group(0)
-        sent = _sentence_containing(text, m.group(1))
-        out.append(_hit("em/en dash: ...%s..." % window, sent or window, anchor=window, sentence=sent or window))
+    for match in _DASH_RE.finditer(prose):
+        origin = _map_offset(index_map, match.start())
+        if match.group(0) == "\u2013" and _en_dash_skip(text, origin):
+            continue
+        window = _dash_window(prose, match.start(), match.end())
+        sent = _sentence_containing(text, match.group(0))
+        out.append(_hit(
+            "em/en dash: ...%s..." % window,
+            sent or window,
+            anchor=window,
+            sentence=sent or window,
+            offset=origin,
+        ))
     return out
 
 
@@ -364,34 +461,37 @@ def r_tailing_negation(text):
 
 
 def r_signpost(text):
+    prose, index_map = _prose_with_map(text)
     pats = (
         r"(let's dive in|let's explore|here's what you need to know|without further ado|"
         r"let's break this down|the real question is|at its core|what really matters|"
         r"the deeper issue)"
     )
     out = []
-    for m in re.finditer(pats, text, re.I):
-        sent = _sentence_containing(text, m.group(0))
+    for match in re.finditer(pats, prose, re.I):
+        sent = _sentence_containing(text, match.group(0))
         out.append(_hit(
-            "signpost/authority trope: %s" % m.group(0),
-            sent or m.group(0),
-            anchor=m.group(0),
-            sentence=sent or m.group(0),
+            "signpost/authority trope: %s" % match.group(0),
+            sent or match.group(0),
+            anchor=match.group(0),
+            sentence=sent or match.group(0),
+            offset=_map_offset(index_map, match.start()),
         ))
     return out
 
 
 def r_inline_header_bullets(text):
-    hits = list(re.finditer(r"(?m)^\s*[-*]\s+\*\*[^*\n]{2,40}:\*\*", text))
+    prose, index_map = _prose_with_map(text)
+    hits = list(re.finditer(r"(?m)^\s*[-*]\s+\*\*[^*\n]{2,40}:\*\*", prose))
     if len(hits) < 3:
         return []
     lines = []
-    for m in hits:
-        line_start = text.rfind("\n", 0, m.start()) + 1
-        line_end = text.find("\n", m.end())
+    for match in hits:
+        line_start = prose.rfind("\n", 0, match.start()) + 1
+        line_end = prose.find("\n", match.end())
         if line_end < 0:
-            line_end = len(text)
-        lines.append(text[line_start:line_end].strip())
+            line_end = len(prose)
+        lines.append(prose[line_start:line_end].strip())
     blob = " ".join(lines)
     first = hits[0].group(0).strip()
     return [_hit(
@@ -399,6 +499,7 @@ def r_inline_header_bullets(text):
         blob,
         anchor=first,
         sentence=blob,
+        offset=_map_offset(index_map, hits[0].start()),
     )]
 
 
@@ -413,26 +514,27 @@ def r_filler_intensifier(text):
         r"undeniably|unmistakably|profoundly|deeply satisfying|"
         r"quite simply|simply put|make no mistake)\b"
     )
-    stripped = _quoted_stripped(text)
+    prose, index_map = _prose_with_map(text)
     out = []
-    for m in re.finditer(pats, stripped, re.I):
-        sent = _sentence_containing(text, m.group(0))
+    for match in re.finditer(pats, prose, re.I):
+        sent = _sentence_containing(text, match.group(0))
         out.append(_hit(
-            "filler intensifier: %s" % m.group(0),
-            sent or m.group(0),
-            anchor=m.group(0),
-            sentence=sent or m.group(0),
+            "filler intensifier: %s" % match.group(0),
+            sent or match.group(0),
+            anchor=match.group(0),
+            sentence=sent or match.group(0),
+            offset=_map_offset(index_map, match.start()),
         ))
     return out
 
 
 def r_words(text):
     """Soft list. Weight is applied by score(); this only finds the phrases."""
-    stripped = _quoted_stripped(text)
+    prose, index_map = _prose_with_map(text)
     spans = []
     for phrase, cre in _WORD_RES:
-        for m in cre.finditer(stripped):
-            spans.append((m.start(), m.end(), m.group(0), phrase))
+        for match in cre.finditer(prose):
+            spans.append((match.start(), match.end(), match.group(0), phrase))
     spans.sort(key=lambda item: (-(item[1] - item[0]), item[0]))
     chosen = []
     occupied = []
@@ -443,9 +545,15 @@ def r_words(text):
         chosen.append((start, frag, phrase))
     chosen.sort(key=lambda item: item[0])
     out = []
-    for _start, frag, _phrase in chosen:
+    for start, frag, _phrase in chosen:
         sent = _sentence_containing(text, frag)
-        out.append(_hit("soft word: %s" % frag, frag, anchor=frag, sentence=sent or frag))
+        out.append(_hit(
+            "soft word: %s" % frag,
+            frag,
+            anchor=frag,
+            sentence=sent or frag,
+            offset=_map_offset(index_map, start),
+        ))
     return out
 
 
@@ -470,14 +578,18 @@ def _has_citation(text):
 
 
 def _named_source(text):
-    for m in _NAMED_SOURCE_RE.finditer(text):
-        tokens = [tok for tok in m.group(1).split() if tok]
+    for match in _NAMED_SOURCE_RE.finditer(text):
+        tokens = [tok for tok in match.group(1).split() if tok]
         content = [
             tok for tok in tokens
             if tok not in _NAME_SKIP and tok.lower() not in {"of", "the", "and", "for", "&"}
         ]
-        if content:
-            return True
+        if not content:
+            continue
+        # "Experts found" is a capitalized opener, not a named source.
+        if all(tok in _COMMON_NOUN_OPENERS for tok in content):
+            continue
+        return True
     return False
 
 
@@ -565,6 +677,7 @@ def score(text, exclude=None, words_mode="warn"):
         if not found:
             continue
         normalized = []
+        cursor = 0
         for item in found:
             if isinstance(item, str):
                 item = _hit(item, item)
@@ -572,7 +685,21 @@ def score(text, exclude=None, words_mode="warn"):
                 item = dict(item)
             item["rule"] = rid
             item["weight"] = weight
-            item["line"] = _line_of(text, item.get("anchor") or item.get("excerpt") or "")
+            anchor = item.get("anchor") or item.get("excerpt") or ""
+            offset = item.get("offset")
+            if isinstance(offset, bool) or not isinstance(offset, int):
+                offset = None
+                if anchor:
+                    idx = text.find(anchor, cursor)
+                    if idx < 0:
+                        idx = text.lower().find(anchor.lower(), cursor)
+                    if idx >= 0:
+                        offset = idx
+            if isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0:
+                item["offset"] = offset
+                if offset + 1 > cursor:
+                    cursor = offset + 1
+            item["line"] = _line_of(text, anchor, offset)
             normalized.append(item)
         hits[rid] = normalized
         weighted += weight * len(normalized)
@@ -601,6 +728,7 @@ def analyze(text, label, exclude=None, words_mode="warn"):
         "weighted": weighted,
         "rate": rate,
         "verdict": _verdict(rate),
+        "short": n < MIN_WORDS,
         "hits": hits,
         "items": items,
     }
@@ -614,6 +742,8 @@ def format_human(rep, quiet=False):
         rep["words"],
         rep["label"],
     )
+    if rep.get("short"):
+        line += "  short: under %d words, max not applied" % MIN_WORDS
     if quiet:
         return line
     lines = [line]
@@ -687,6 +817,7 @@ def format_json(reports):
             "weighted": rep["weighted"],
             "rate_per_1k": round(rep["rate"], 4),
             "verdict": rep["verdict"],
+            "short": bool(rep.get("short")),
             "items": items,
         })
     payload = {
@@ -747,11 +878,12 @@ def _load_inputs(args):
             label = "%d assistant turn%s (combined)" % (len(turns), "" if len(turns) == 1 else "s")
             inputs.append((label, "\n\n".join(turns), set()))
     if args.stdin:
-        inputs.append(("<stdin>", sys.stdin.read(), set()))
+        label = args.label or "<stdin>"
+        inputs.append((label, sys.stdin.read(), set()))
     for name in args.files:
         path = os.path.expanduser(name)
         try:
-            with open(path, encoding="utf-8") as handle:
+            with open(path, encoding="utf-8", errors="replace") as handle:
                 text = handle.read()
         except OSError as err:
             print("writing-check: could not do it (%s)" % err.strerror, file=sys.stderr)
@@ -777,6 +909,7 @@ def _parser():
     )
     ap.add_argument("files", nargs="*")
     ap.add_argument("--stdin", action="store_true", help="score stdin")
+    ap.add_argument("--label", help="label for --stdin (default: <stdin>)")
     ap.add_argument("--transcript", help="score assistant turns in a JSONL transcript")
     ap.add_argument("--last", type=int, help="only the last N assistant turns")
     ap.add_argument("--quiet", action="store_true", help="one summary line per input")
@@ -788,8 +921,19 @@ def _parser():
 
 
 def main(argv=None):
+    try:
+        return _main(argv)
+    except Exception as err:
+        print("could not do it: %s: %s" % (type(err).__name__, err), file=sys.stderr)
+        return 3
+
+
+def _main(argv=None):
     ap = _parser()
     args = ap.parse_args(argv)
+    if args.last is not None and args.last < 1:
+        print("writing-check: could not do it (--last must be 1 or more)", file=sys.stderr)
+        return 2
     inputs, early = _load_inputs(args)
     if early is not None:
         return early
@@ -806,14 +950,16 @@ def main(argv=None):
         for rep in reports:
             print(format_human(rep, quiet=args.quiet))
     if args.max is not None:
-        worst = max(rep["rate"] for rep in reports)
-        if worst > args.max:
-            msg = "writing-check: FAIL. %.1f/1k exceeds --max %s" % (worst, args.max)
-            if args.json:
-                print(msg, file=sys.stderr)
-            else:
-                print("\n" + msg)
-            return 1
+        rates = [rep["rate"] for rep in reports if not rep.get("short")]
+        if rates:
+            worst = max(rates)
+            if worst > args.max:
+                msg = "writing-check: FAIL. %.1f/1k exceeds --max %s" % (worst, args.max)
+                if args.json:
+                    print(msg, file=sys.stderr)
+                else:
+                    print("\n" + msg)
+                return 1
     return 0
 
 

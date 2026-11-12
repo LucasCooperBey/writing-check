@@ -21,7 +21,7 @@ if [ ! -f "$CHECK" ]; then
 fi
 
 payload=$(cat || true)
-parsed=$(printf '%s' "$payload" | python3 -c '
+parsed=$(printf '%s' "$payload" | python3 -I -c '
 import json, sys
 raw = sys.stdin.read()
 try:
@@ -61,7 +61,7 @@ fi
 
 max=${WRITING_CHECK_MAX:-15}
 set +e
-summary=$(python3 "$CHECK" --transcript "$path" --last 1 --max "$max" --quiet)
+summary=$(python3 -I "$CHECK" --transcript "$path" --last 1 --max "$max" --quiet)
 status=$?
 set -e
 

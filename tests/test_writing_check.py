@@ -7,6 +7,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import atexit
+import io
 import json
 import os
 import pathlib
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -283,11 +285,15 @@ class InterfaceTests(unittest.TestCase):
 
     def test_max_exit_codes(self):
         # source: Door 29, --max exits 1 over the rate and 0 at or under it
+        long_over = DIRTY * 4 + CLEAN * 10
         with tempfile.TemporaryDirectory() as tmp:
             clean = self._write(tmp, "clean.md", CLEAN)
-            dirty = self._write(tmp, "dirty.md", DIRTY)
+            dirty = self._write(tmp, "dirty.md", long_over)
             _hits, weighted, count = wc.score(DIRTY)
             self.assertGreater(weighted / float(count) * 1000.0, 15)
+            _lhits, lweight, lcount = wc.score(long_over)
+            self.assertGreaterEqual(lcount, 80)
+            self.assertGreater(lweight / float(lcount) * 1000.0, 15)
             _chits, cweight, _ccount = wc.score(CLEAN)
             self.assertEqual(cweight, 0)
             under = self._run("--max", "15", "--quiet", clean)
@@ -391,17 +397,20 @@ class InterfaceTests(unittest.TestCase):
 
 class HookTests(unittest.TestCase):
     def _transcript(self, directory):
+        # The floor exempts a short turn, so this sample stays long enough that --max still applies.
+        text = "The page is a promise, not a form. " * 16
         line = json.dumps({
             "type": "assistant",
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": "The page is a promise, not a form."}],
+                "content": [{"type": "text", "text": text}],
             },
         })
         path = os.path.join(directory, "transcript.jsonl")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(line + "\n")
-        _hits, weighted, count = wc.score("The page is a promise, not a form.")
+        _hits, weighted, count = wc.score(text)
+        self.assertGreaterEqual(count, 80)
         self.assertGreater(weighted / float(count) * 1000.0, 15)
         return path
 
@@ -439,6 +448,200 @@ class HookTests(unittest.TestCase):
             })
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("/1k", proc.stderr)
+
+    def test_stop_hook_does_not_import_cwd_json(self):
+        # source: 11-12 finding, the Stop hook imported json.py from its working folder
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "json-marker.txt")
+            with open(os.path.join(tmp, "json.py"), "w", encoding="utf-8") as handle:
+                handle.write("open(%r, 'w').write('ran\\n')\n" % marker)
+            transcript = os.path.join(tmp, "transcript.jsonl")
+            turn = (
+                "The weekday ordering page lists the country loaf and the sesame bun "
+                "for people who stop at the counter before work."
+            )
+            with open(transcript, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": turn}]},
+                }) + "\n")
+            env = os.environ.copy()
+            env["WRITING_CHECK_MAX"] = "15"
+            proc = subprocess.run(
+                ["sh", HOOK],
+                input=json.dumps({
+                    "stop_hook_active": False,
+                    "transcript_path": transcript,
+                    "hook_event_name": "Stop",
+                }),
+                text=True,
+                capture_output=True,
+                cwd=tmp,
+                env=env,
+            )
+            # Checked inside the with block: the folder and any marker are gone once it exits.
+            self.assertFalse(os.path.exists(marker), proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+
+class ReviewFindingTests(unittest.TestCase):
+    def _run(self, *args, input_text=None):
+        return subprocess.run(
+            [sys.executable, SCRIPT, *args],
+            input=input_text,
+            text=True,
+            capture_output=True,
+        )
+
+    def _write(self, directory, name, text):
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_short_reply_max_does_not_fail(self):
+        # source: 11-12 finding, a 10-word sentence tripped solo-para and --max blocked it
+        text = "This is the whole point of the page now friend.\n"
+        self.assertEqual(len(wc._words(text)), 10)
+        self.assertTrue(wc.r_solo_para(text))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "reply.md", text)
+            proc = self._run("--max", "15", "--quiet", path)
+            raw = self._run("--max", "15", "--json", path)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("/1k", proc.stdout)
+        self.assertIn("short: under 80 words, max not applied", proc.stdout)
+        self.assertNotIn("FAIL", proc.stdout + proc.stderr)
+        self.assertEqual(raw.returncode, 0, raw.stderr)
+        self.assertTrue(json.loads(raw.stdout)["results"][0]["short"])
+
+    def test_long_draft_over_max_still_exits_1(self):
+        # source: 11-12 finding, the 80-word floor must not hide a long draft over the max
+        hit = (
+            "The weekday counter is genuinely ready for the morning loaf "
+            "and the sesame bun today. "
+        )
+        pad = (
+            "The weekday ordering page lists the country loaf and the sesame bun "
+            "for people who stop at the counter before work. "
+        )
+        text = hit * 4 + pad * 8
+        _hits, weighted, count = wc.score(text)
+        self.assertGreaterEqual(count, 200)
+        self.assertGreater(weighted / float(count) * 1000.0, 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "draft.md", text)
+            proc = self._run("--max", "15", "--quiet", path)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("FAIL", proc.stdout)
+        self.assertNotIn("short: under 80 words", proc.stdout)
+
+    def test_latin1_file_scores_without_traceback(self):
+        # source: 11-12 finding, a non-UTF-8 file raised UnicodeDecodeError and blocked the commit
+        raw = (
+            b"The weekday ordering page lists the country loaf and the sesame bun "
+            b"for people who stop at the counter before work.\n"
+            b"Cafe\xe9 opens early.\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "draft.md")
+            with open(path, "wb") as handle:
+                handle.write(raw)
+            proc = self._run("--quiet", path)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("/1k", proc.stdout)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("UnicodeDecodeError", proc.stderr + proc.stdout)
+
+    def test_unexpected_exception_exits_3(self):
+        # source: 11-12 finding, an uncaught exception exited 1 and the Stop hook read it as over the max
+        def boom(_text):
+            raise RuntimeError("boom")
+
+        old = wc.RULES
+        patched = []
+        for rid, weight, desc, fn in old:
+            if rid == "dash":
+                patched.append((rid, weight, desc, boom))
+            else:
+                patched.append((rid, weight, desc, fn))
+        wc.RULES = tuple(patched)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self._write(tmp, "draft.md", CLEAN)
+                err = io.StringIO()
+                out = io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = wc.main([path])
+        finally:
+            wc.RULES = old
+        self.assertEqual(code, 3)
+        self.assertEqual(err.getvalue().strip(), "could not do it: RuntimeError: boom")
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertNotIn("Traceback", out.getvalue())
+
+    def test_dash_inside_code_fence_is_not_a_hit(self):
+        # source: 11-12 finding, a dash inside a code fence was a hit over a smaller word count
+        text = "The counter opens before work.\n\n```\nkeep \u2014 the dash\n```\n\nThe loaf is ready.\n"
+        self.assertEqual(wc.r_dash(text), [])
+
+    def test_two_dashes_ten_characters_apart_both_count(self):
+        # source: 11-12 finding, the dash pattern consumed the next dash inside a 28-character window
+        text = "Alpha \u2014" + "0123456789" + "\u2014 omega continues past the second dash.\n"
+        self.assertEqual(len(wc.r_dash(text)), 2)
+
+    def test_experts_found_is_not_a_named_source(self):
+        # source: 11-12 finding, a capitalized sentence opener was treated as a named source
+        text = "Experts found 80% of teams ship the page before the counter opens on Monday."
+        self.assertFalse(wc._named_source(text))
+        self.assertFalse(wc._sourced(text))
+        kept = "Gallup found 80% of teams ship the page before the counter opens on Monday."
+        self.assertTrue(wc._named_source(kept))
+        self.assertTrue(wc._sourced(kept))
+
+    def test_repeated_sentence_reports_each_line(self):
+        # source: 11-12 finding, a repeated sentence reported the first line for every hit
+        sentence = "Where they are genuinely incompatible, pick one and explain the choice."
+        text = "\n".join([
+            "Intro stays on line one.",
+            "",
+            sentence,
+            "",
+            "Middle stays on line five.",
+            "",
+            "",
+            "",
+            sentence,
+        ])
+        hits, _weighted, _count = wc.score(text)
+        found = sorted(item["line"] for item in hits["filler"])
+        self.assertEqual(found, [3, 9])
+
+    def test_last_rejects_zero_and_negative(self):
+        # source: 11-12 finding, --last accepted 0 and negative numbers
+        early = {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "The early turn lists the country loaf for the weekday counter."}]},
+        }
+        late = {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "The later turn lists the sesame bun for the weekday counter."}]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                tmp,
+                "session.jsonl",
+                json.dumps(early) + "\n" + json.dumps(late) + "\n",
+            )
+            zero = self._run("--transcript", path, "--last", "0", "--quiet")
+            neg = self._run("--transcript", path, "--last", "-1", "--quiet")
+        self.assertEqual(zero.returncode, 2, zero.stdout + zero.stderr)
+        self.assertEqual(neg.returncode, 2, neg.stdout + neg.stderr)
+        self.assertIn("1 or more", zero.stderr)
+        self.assertIn("1 or more", neg.stderr)
+        self.assertNotIn("/1k", zero.stdout)
+        self.assertNotIn("/1k", neg.stdout)
 
 
 if __name__ == "__main__":
