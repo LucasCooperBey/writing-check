@@ -1,0 +1,52 @@
+#!/bin/sh
+# Score staged markdown and text files.
+# did the work: the checker ran on staged .md and .txt files.
+# had no work: no staged file of those types.
+# could not do it: git or the checker is missing.
+
+set -eu
+
+if ! command -v git >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+  echo "writing-check: could not do it" >&2
+  exit 0
+fi
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "writing-check: could not do it" >&2
+  exit 0
+}
+cd "$root" || {
+  echo "writing-check: could not do it" >&2
+  exit 0
+}
+check="$root/writing_check.py"
+if [ ! -f "$check" ]; then
+  echo "writing-check: could not do it" >&2
+  exit 0
+fi
+
+list=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(md|txt)$' || true)
+if [ -z "$list" ]; then
+  echo "writing-check: had no work" >&2
+  exit 0
+fi
+
+set --
+set -f
+IFS='
+'
+for f in $list; do
+  [ -n "$f" ] || continue
+  set -- "$@" "$f"
+done
+unset IFS
+set +f
+
+if [ "$#" -eq 0 ]; then
+  echo "writing-check: had no work" >&2
+  exit 0
+fi
+
+echo "writing-check: did the work" >&2
+max=${WRITING_CHECK_MAX:-15}
+python3 "$check" --max "$max" -- "$@"
