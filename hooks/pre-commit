@@ -2,7 +2,8 @@
 # Score the staged blobs of markdown and text files, not the working tree.
 # did the work: the checker ran on staged .md and .txt files.
 # had no work: no staged file of those types.
-# could not do it: git is missing, or the checker could not be found.
+# could not do it: git is missing, the checker could not be found, a staged
+# blob could not be read, or the checker returned a status other than 0 or 1.
 
 set -eu
 
@@ -53,8 +54,10 @@ list_file=$(mktemp "${TMPDIR:-/tmp}/writing-check.XXXXXX")
 trap 'rm -f "$list_file"' EXIT
 lines_file=$(mktemp "${TMPDIR:-/tmp}/writing-check.XXXXXX")
 trap 'rm -f "$list_file" "$lines_file"' EXIT
+blob=$(mktemp "${TMPDIR:-/tmp}/writing-check.XXXXXX")
+trap 'rm -f "$list_file" "$lines_file" "$blob"' EXIT
 
-git diff --cached --name-only -z --diff-filter=ACM > "$list_file" || {
+git diff --cached --name-only -z --diff-filter=ACMR > "$list_file" || {
   echo "writing-check: could not do it" >&2
   exit 0
 }
@@ -69,18 +72,22 @@ while IFS= read -r path || [ -n "$path" ]; do
     *.md|*.txt) ;;
     *) continue ;;
   esac
+  if ! git show ":$path" > "$blob"; then
+    echo "writing-check: could not do it ($path)" >&2
+    continue
+  fi
   if [ "$scored" -eq 0 ]; then
     echo "writing-check: did the work" >&2
   fi
   scored=1
   set +e
-  git show ":$path" | python3 "$check" --max "$max" --stdin --label="$path"
+  python3 -I "$check" --max "$max" --stdin --label="$path" < "$blob"
   status=$?
   set -e
   if [ "$status" -eq 1 ]; then
     fail=1
   elif [ "$status" -ne 0 ]; then
-    exit "$status"
+    echo "writing-check: could not do it ($path)" >&2
   fi
 done < "$lines_file"
 

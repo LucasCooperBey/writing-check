@@ -26,6 +26,7 @@ import writing_check as wc
 BEFORE = os.path.join(ROOT, "examples", "before.md")
 AFTER = os.path.join(ROOT, "examples", "after.md")
 HOOK = os.path.join(ROOT, "hooks", "claude-code-stop-hook.sh")
+PRECOMMIT = os.path.join(ROOT, "hooks", "pre-commit")
 SCRIPT = os.path.join(ROOT, "writing_check.py")
 
 
@@ -511,7 +512,10 @@ class ReviewFindingTests(unittest.TestCase):
             raw = self._run("--max", "15", "--json", path)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("/1k", proc.stdout)
-        self.assertIn("short: under 80 words, max not applied", proc.stdout)
+        self.assertIn(
+            "short: under 80 words, rate counted over 80 words, structure rules off",
+            proc.stdout,
+        )
         self.assertNotIn("FAIL", proc.stdout + proc.stderr)
         self.assertEqual(raw.returncode, 0, raw.stderr)
         self.assertTrue(json.loads(raw.stdout)["results"][0]["short"])
@@ -642,6 +646,236 @@ class ReviewFindingTests(unittest.TestCase):
         self.assertIn("1 or more", neg.stderr)
         self.assertNotIn("/1k", zero.stdout)
         self.assertNotIn("/1k", neg.stdout)
+
+
+class Round3ReviewTests(unittest.TestCase):
+    def _run(self, *args, input_bytes=None, env=None):
+        kwargs = {"capture_output": True, "env": env}
+        if input_bytes is None:
+            kwargs["text"] = True
+        return subprocess.run([sys.executable, SCRIPT, *args], input=input_bytes, **kwargs)
+
+    def _git_env(self):
+        env = os.environ.copy()
+        for key in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_PREFIX",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "WRITING_CHECK",
+            "WRITING_CHECK_MAX",
+        ):
+            env.pop(key, None)
+        env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_AUTHOR_NAME"] = "Writing Check"
+        env["GIT_AUTHOR_EMAIL"] = "writing-check@example.com"
+        env["GIT_COMMITTER_NAME"] = "Writing Check"
+        env["GIT_COMMITTER_EMAIL"] = "writing-check@example.com"
+        return env
+
+    def _init_repo(self, tmp):
+        env = self._git_env()
+        init = subprocess.run(
+            ["git", "init", "-q", "-b", "main"],
+            cwd=tmp,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(init.returncode, 0, init.stderr)
+        hook = os.path.join(tmp, ".git", "hooks", "pre-commit")
+        shutil.copy(PRECOMMIT, hook)
+        os.chmod(hook, 0o755)
+        return env
+
+    def _git(self, tmp, env, *args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_short_em_dash_exceeds_max(self):
+        # source: 11-12 review of a7f7ca8, a draft under 80 words is exempt from --max
+        dash = chr(0x2014)
+        text = "The weekday counter lists the loaf " + dash + " and the bun for pickup now.\n"
+        self.assertEqual(len(wc._words(text)), 12)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "draft.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            proc = self._run("--max", "15", "--quiet", path)
+        self.assertIn("37.5/1k", proc.stdout)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_short_filler_exceeds_max(self):
+        # source: 11-12 review of a7f7ca8, a draft under 80 words is exempt from --max
+        text = "The weekday counter is genuinely ready for the morning loaf today friend.\n"
+        self.assertEqual(len(wc._words(text)), 12)
+        self.assertTrue(wc.r_filler_intensifier(text))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "draft.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            proc = self._run("--max", "15", "--quiet", path)
+        self.assertIn("25.0/1k", proc.stdout)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_short_clean_stays_under_max(self):
+        # source: 11-12 review of a7f7ca8, a draft under 80 words is exempt from --max
+        text = "The weekday counter lists the loaf and the bun for pickup now.\n"
+        self.assertEqual(len(wc._words(text)), 12)
+        self.assertTrue(wc.r_solo_para(text))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "draft.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            proc = self._run("--max", "15", "--quiet", path)
+        self.assertIn("  0.0/1k", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_stdin_utf8_replace_under_c_locale(self):
+        # source: 11-12 review of a7f7ca8, --stdin reads with the locale encoding
+        # Under LC_ALL=C, Python 3.7 and later read stdin as UTF-8 with surrogateescape,
+        # so the old read only raised under a UTF-8 locale. Each locale is checked.
+        for locale_name in ("C", "C.UTF-8", "en_US.UTF-8"):
+            with self.subTest(locale=locale_name):
+                env = os.environ.copy()
+                env["LC_ALL"] = locale_name
+                env.pop("PYTHONIOENCODING", None)
+                env.pop("PYTHONUTF8", None)
+                proc = self._run(
+                    "--stdin",
+                    "--quiet",
+                    input_bytes=b"caf\xe9 is open late tonight.",
+                    env=env,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(b"/1k", proc.stdout)
+                self.assertNotIn(b"UnicodeDecodeError", proc.stderr)
+                self.assertNotIn(b"Traceback", proc.stderr)
+
+    def test_precommit_latin1_does_not_block(self):
+        # source: 11-12 review of a7f7ca8, a staged Latin-1 file blocks the commit
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._init_repo(tmp)
+            env["WRITING_CHECK"] = SCRIPT
+            with open(os.path.join(tmp, "note.md"), "wb") as handle:
+                handle.write(
+                    b"Cafe\xe9 is open late tonight for the weekday counter crowd.\n"
+                )
+            added = self._git(tmp, env, "add", "note.md")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            proc = self._git(tmp, env, "commit", "-m", "add note")
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertIn("/1k", combined)
+        self.assertNotIn("could not do it", combined)
+
+    def test_precommit_renamed_em_dash_blocks(self):
+        # source: 11-12 review of a7f7ca8, a renamed and edited file is not scored
+        dash = chr(0x2014)
+        clean = "The weekday counter lists the loaf and the bun for pickup now.\n"
+        dirty = "The weekday counter lists the loaf " + dash + " and the bun for pickup now.\n"
+        self.assertEqual(len(wc._words(dirty)), 12)
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._init_repo(tmp)
+            env["WRITING_CHECK"] = SCRIPT
+            with open(os.path.join(tmp, "note.md"), "w", encoding="utf-8") as handle:
+                handle.write(clean * 6)
+            added = self._git(tmp, env, "add", "note.md")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            first = self._git(tmp, env, "commit", "-m", "add note")
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            moved = self._git(tmp, env, "mv", "note.md", "page.md")
+            self.assertEqual(moved.returncode, 0, moved.stderr)
+            with open(os.path.join(tmp, "page.md"), "w", encoding="utf-8") as handle:
+                handle.write(clean * 5 + dirty)
+            staged = self._git(tmp, env, "add", "--", "page.md")
+            self.assertEqual(staged.returncode, 0, staged.stderr)
+            status = self._git(tmp, env, "diff", "--cached", "--name-status")
+            self.assertTrue(status.stdout.startswith("R"), status.stdout)
+            blocked = self._git(tmp, env, "commit", "-m", "rename page")
+        combined = blocked.stdout + blocked.stderr
+        self.assertEqual(blocked.returncode, 1, combined)
+        self.assertIn("37.5/1k", combined)
+
+    def test_precommit_checker_error_exits_0(self):
+        # source: 11-12 review of a7f7ca8, the hook exits with the checker status when it is neither 0 nor 1
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._init_repo(tmp)
+            standin = os.path.join(tmp, "standin.py")
+            with open(standin, "w", encoding="utf-8") as handle:
+                handle.write("import sys\nsys.exit(3)\n")
+            env["WRITING_CHECK"] = standin
+            with open(os.path.join(tmp, "note.md"), "w", encoding="utf-8") as handle:
+                handle.write("The weekday counter lists the loaf and the bun for pickup now.\n")
+            added = self._git(tmp, env, "add", "note.md")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            hook = os.path.join(tmp, ".git", "hooks", "pre-commit")
+            for shell in ("/bin/sh", "/bin/dash"):
+                proc = subprocess.run(
+                    [shell, hook],
+                    cwd=tmp,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 0, shell + "\n" + proc.stderr)
+                self.assertIn("could not do it", proc.stderr)
+                self.assertIn("note.md", proc.stderr)
+
+    def test_precommit_does_not_import_repo_json(self):
+        # source: 11-12 review of a7f7ca8, python3 puts the repository root first on the module path
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self._init_repo(tmp)
+            marker = os.path.join(tmp, "json-marker.txt")
+            with open(os.path.join(tmp, "json.py"), "w", encoding="utf-8") as handle:
+                handle.write("open(%r, 'w').write('ran\\n')\n" % marker)
+            shutil.copy(SCRIPT, os.path.join(tmp, "writing_check.py"))
+            with open(os.path.join(tmp, "note.md"), "w", encoding="utf-8") as handle:
+                handle.write("The weekday counter lists the loaf and the bun for pickup now.\n")
+            added = self._git(tmp, env, "add", "note.md")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            hook = os.path.join(tmp, ".git", "hooks", "pre-commit")
+            proc = subprocess.run(
+                ["sh", hook],
+                cwd=tmp,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("/1k", proc.stdout, proc.stderr)
+            self.assertFalse(os.path.exists(marker), proc.stderr + proc.stdout)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_repeated_filler_keeps_its_sentence(self):
+        # source: 11-12 review of a7f7ca8, _sentence_containing returns the first sentence holding the fragment
+        first = "The morning loaf is genuinely warm on the weekday counter."
+        second = "The evening bun is genuinely fresh for the late pickup."
+        text = first + "\n" + second + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "draft.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            proc = self._run("--json", path)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        fillers = [
+            item
+            for item in json.loads(proc.stdout)["results"][0]["items"]
+            if item["rule"] == "filler"
+        ]
+        self.assertEqual(len(fillers), 2)
+        self.assertIn("morning loaf", fillers[0]["sentence"])
+        self.assertIn("evening bun", fillers[1]["sentence"])
+        self.assertNotEqual(fillers[0]["sentence"], fillers[1]["sentence"])
+        self.assertNotIn("evening", fillers[0]["sentence"])
+        self.assertNotIn("morning", fillers[1]["sentence"])
 
 
 if __name__ == "__main__":

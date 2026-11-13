@@ -9,9 +9,9 @@ curl -fsSL -o writing_check.py https://raw.githubusercontent.com/LucasCooperBey/
 python3 writing_check.py draft.md
 ```
 
-Add --max 15 when you want a failing exit code once the weighted rate goes over 15 hits per 1,000 words. A draft under 80 words still prints its rate, and --max does not fail that draft. Leave the max off when you only want the report.
+Add --max 15 when you want a failing exit code once the weighted rate goes over 15 hits per 1,000 words. A draft under 80 words still prints its rate, counted over 80 words with the structure rules off, and --max applies to that rate. Leave the max off when you only want the report.
 
-Score a markdown file, a text file, or an HTML file with the tags stripped by passing the path. `--stdin` reads the draft from the terminal, and `--transcript FILE.jsonl --last N` scores the last N assistant turns in a Claude Code transcript. `--quiet` prints one summary line per input. `--json` prints the rule id, the weight, the line, and an excerpt for each hit, plus totals. `--words warn` is the default and lists the soft words at weight 0, while `--words off` hides that list. `--rewrite-prompt` prints a prompt you can paste into any chat model and then exits 0. Exit codes are 0 when the draft is under the max, under 80 words, or when no max is set, 1 when the rate exceeds the max, 2 when the arguments are wrong, and 3 when the checker could not run, which keeps a bad call from looking like a clean draft.
+Score a markdown file, a text file, or an HTML file with the tags stripped by passing the path. `--stdin` reads the draft from the terminal, and `--transcript FILE.jsonl --last N` scores the last N assistant turns in a Claude Code transcript. `--quiet` prints one summary line per input. `--json` prints the rule id, the weight, the line, and an excerpt for each hit, plus totals. `--words warn` is the default and lists the soft words at weight 0, while `--words off` hides that list. `--rewrite-prompt` prints a prompt you can paste into any chat model and then exits 0. Exit codes are 0 when the draft is under the max or when no max is set, 1 when the rate exceeds the max, 2 when the arguments are wrong, and 3 when the checker could not run, which keeps a bad call from looking like a clean draft.
 
 ## Example
 

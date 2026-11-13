@@ -24,7 +24,8 @@ import os
 import re
 import sys
 
-# A short draft still prints a rate. --max does not fail it.
+# Under MIN_WORDS, the rate uses this floor and solo-para, punchline, and three
+# do not run. --max still applies to that rate.
 MIN_WORDS = 80
 
 SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -262,7 +263,40 @@ def _hit(detail, excerpt, anchor=None, sentence=None, offset=None):
     return item
 
 
-def _sentence_containing(text, fragment):
+def _split_kept(pattern, text):
+    last = 0
+    for match in pattern.finditer(text):
+        yield last, match.start(), text[last:match.start()]
+        last = match.end()
+    yield last, len(text), text[last:]
+
+
+def _sentence_at_offset(text, offset):
+    """Return the block sentence that spans a prose offset.
+
+    The offset is an index into _quoted_stripped(text), which is the prose
+    the lexical rules scan. _block_sentences walks that same prose.
+    """
+    prose = _quoted_stripped(text)
+    if offset < 0 or offset > len(prose):
+        return ""
+    for block_start, _block_end, block in _split_kept(BLOCK_SPLIT, prose):
+        for rel_start, rel_end, piece in _split_kept(SENT_SPLIT, block):
+            stripped = piece.strip()
+            if not stripped:
+                continue
+            start = block_start + rel_start
+            end = block_start + rel_end
+            if start <= offset < end or (offset == len(prose) and end == len(prose)):
+                return _one_line(stripped)
+    return ""
+
+
+def _sentence_containing(text, fragment, offset=None):
+    if isinstance(offset, int) and not isinstance(offset, bool):
+        sent = _sentence_at_offset(text, offset)
+        if sent:
+            return sent
     frag = (fragment or "").strip()
     if not frag:
         return ""
@@ -324,7 +358,7 @@ def r_dash(text):
         if match.group(0) == "\u2013" and _en_dash_skip(text, origin):
             continue
         window = _dash_window(prose, match.start(), match.end())
-        sent = _sentence_containing(text, match.group(0))
+        sent = _sentence_containing(text, match.group(0), match.start())
         out.append(_hit(
             "em/en dash: ...%s..." % window,
             sent or window,
@@ -469,7 +503,7 @@ def r_signpost(text):
     )
     out = []
     for match in re.finditer(pats, prose, re.I):
-        sent = _sentence_containing(text, match.group(0))
+        sent = _sentence_containing(text, match.group(0), match.start())
         out.append(_hit(
             "signpost/authority trope: %s" % match.group(0),
             sent or match.group(0),
@@ -517,7 +551,7 @@ def r_filler_intensifier(text):
     prose, index_map = _prose_with_map(text)
     out = []
     for match in re.finditer(pats, prose, re.I):
-        sent = _sentence_containing(text, match.group(0))
+        sent = _sentence_containing(text, match.group(0), match.start())
         out.append(_hit(
             "filler intensifier: %s" % match.group(0),
             sent or match.group(0),
@@ -546,7 +580,7 @@ def r_words(text):
     chosen.sort(key=lambda item: item[0])
     out = []
     for start, frag, _phrase in chosen:
-        sent = _sentence_containing(text, frag)
+        sent = _sentence_containing(text, frag, start)
         out.append(_hit(
             "soft word: %s" % frag,
             frag,
@@ -664,10 +698,14 @@ def score(text, exclude=None, words_mode="warn"):
 
     The denominator matches what the rules scan, so a long quotation does not
     dilute the rate. Soft-list hits use weight 0 and never move `weighted`.
+    Under MIN_WORDS, solo-para, punchline, and three are not run.
     """
     skipped = set(exclude or ())
     if words_mode == "off":
         skipped.add("words")
+    n = max(len(_words(_quoted_stripped(text))), 1)
+    if n < MIN_WORDS:
+        skipped.update(("solo-para", "punchline", "three"))
     hits = {}
     weighted = 0
     for rid, weight, _desc, fn in RULES:
@@ -703,7 +741,6 @@ def score(text, exclude=None, words_mode="warn"):
             normalized.append(item)
         hits[rid] = normalized
         weighted += weight * len(normalized)
-    n = max(len(_words(_quoted_stripped(text))), 1)
     return hits, weighted, n
 
 
@@ -717,7 +754,8 @@ def _verdict(rate):
 
 def analyze(text, label, exclude=None, words_mode="warn"):
     hits, weighted, n = score(text, exclude=exclude, words_mode=words_mode)
-    rate = weighted / float(n) * 1000.0
+    denom = MIN_WORDS if n < MIN_WORDS else n
+    rate = weighted / float(denom) * 1000.0
     items = []
     for rid, _weight, _desc, _fn in RULES:
         items.extend(hits.get(rid, []))
@@ -743,7 +781,10 @@ def format_human(rep, quiet=False):
         rep["label"],
     )
     if rep.get("short"):
-        line += "  short: under %d words, max not applied" % MIN_WORDS
+        line += "  short: under %d words, rate counted over %d words, structure rules off" % (
+            MIN_WORDS,
+            MIN_WORDS,
+        )
     if quiet:
         return line
     lines = [line]
@@ -805,6 +846,7 @@ def format_json(reports):
                 "weight": item["weight"],
                 "line": item["line"],
                 "excerpt": item["excerpt"],
+                "sentence": item.get("sentence") or "",
             })
         total_hits += rep["hit_count"]
         total_weighted += rep["weighted"]
@@ -879,7 +921,8 @@ def _load_inputs(args):
             inputs.append((label, "\n\n".join(turns), set()))
     if args.stdin:
         label = args.label or "<stdin>"
-        inputs.append((label, sys.stdin.read(), set()))
+        raw = sys.stdin.buffer.read()
+        inputs.append((label, raw.decode("utf-8", errors="replace"), set()))
     for name in args.files:
         path = os.path.expanduser(name)
         try:
@@ -950,7 +993,7 @@ def _main(argv=None):
         for rep in reports:
             print(format_human(rep, quiet=args.quiet))
     if args.max is not None:
-        rates = [rep["rate"] for rep in reports if not rep.get("short")]
+        rates = [rep["rate"] for rep in reports]
         if rates:
             worst = max(rates)
             if worst > args.max:
