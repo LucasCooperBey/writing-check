@@ -922,7 +922,7 @@ def _load_inputs(args):
     if args.stdin:
         label = args.label or "<stdin>"
         raw = sys.stdin.buffer.read()
-        inputs.append((label, raw.decode("utf-8", errors="replace"), set()))
+        inputs.append((label, raw.decode("utf-8-sig", errors="replace"), set()))
     for name in args.files:
         path = os.path.expanduser(name)
         try:

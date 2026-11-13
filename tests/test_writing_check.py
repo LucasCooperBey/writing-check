@@ -760,6 +760,14 @@ class Round3ReviewTests(unittest.TestCase):
                 self.assertNotIn(b"UnicodeDecodeError", proc.stderr)
                 self.assertNotIn(b"Traceback", proc.stderr)
 
+    def test_stdin_drops_a_utf8_bom(self):
+        # source: 11-12 review of db69a1e, a UTF-8 BOM on stdin stayed as U+FEFF in the first word
+        text = "The weekday counter is genuinely ready for the morning loaf today friend."
+        plain = self._run("--stdin", "--json", input_bytes=text.encode("utf-8"))
+        bom = self._run("--stdin", "--json", input_bytes=b"\xef\xbb\xbf" + text.encode("utf-8"))
+        self.assertEqual(bom.returncode, 0, bom.stderr)
+        self.assertEqual(json.loads(bom.stdout.decode("utf-8")), json.loads(plain.stdout.decode("utf-8")))
+
     def test_precommit_latin1_does_not_block(self):
         # source: 11-12 review of a7f7ca8, a staged Latin-1 file blocks the commit
         with tempfile.TemporaryDirectory() as tmp:
@@ -819,6 +827,8 @@ class Round3ReviewTests(unittest.TestCase):
             self.assertEqual(added.returncode, 0, added.stderr)
             hook = os.path.join(tmp, ".git", "hooks", "pre-commit")
             for shell in ("/bin/sh", "/bin/dash"):
+                if not os.path.exists(shell):
+                    continue
                 proc = subprocess.run(
                     [shell, hook],
                     cwd=tmp,
