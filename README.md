@@ -1,4 +1,46 @@
+<h1 align="center">writing-check</h1>
+
+<p align="center"><strong>Score a draft for the shapes that make writing read as machine-made, line by line, before you post it.</strong></p>
+
+<p align="center">
+  <a href="https://github.com/LucasCooperBey/100-doors"><img alt="100 Doors: Door 29" src="https://img.shields.io/badge/100%20Doors-Door%2029-f94bf3"></a>
+  <a href="LICENSE"><img alt="license MIT" src="https://img.shields.io/badge/license-MIT-9aff4a"></a>
+  <img alt="python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-3776ab">
+  <img alt="dependencies none" src="https://img.shields.io/badge/dependencies-none-9aff4a">
+  <img alt="hooks Claude Code · git" src="https://img.shields.io/badge/hooks-Claude%20Code%20%C2%B7%20git-5ac4bf">
+  <a href="https://github.com/LucasCooperBey/writing-check/commits/main"><img alt="last commit" src="https://img.shields.io/github/last-commit/LucasCooperBey/writing-check?color=9aff4a&label=updated"></a>
+</p>
+
+<p align="center"><a href="#quick-start">Quick start</a> · <a href="#example">Example</a> · <a href="#rules">Rules</a> · <a href="#limits">Limits</a> · <a href="https://github.com/LucasCooperBey/100-doors">All 100 Doors</a></p>
+
 writing-check scores a draft for writing shapes that read as performed craft. It is one Python file from the standard library, and you run it on a draft before you post.
+
+**Who it's for:** anyone who drafts posts, emails or docs with AI help and wants them to sound like a person wrote them.
+
+## Contents
+
+- [What's inside](#whats-inside)
+- [Quick start](#quick-start)
+- [Example](#example)
+- [Rules](#rules)
+- [Why shapes](#why-shapes)
+- [Rewrite prompt](#rewrite-prompt)
+- [Claude Code Stop hook](#claude-code-stop-hook)
+- [Git pre-commit hook](#git-pre-commit-hook)
+- [Limits](#limits)
+- [Part of 100 Doors](#part-of-100-doors)
+- [Credits](#credits)
+- [License](#license)
+
+## What's inside
+
+| Path | What it is |
+|---|---|
+| `writing_check.py` | The checker: one file, standard library only |
+| `examples/before.md, examples/after.md` | A draft full of the shapes, and the same news without them |
+| `hooks/claude-code-stop-hook.sh` | Claude Code Stop hook: the model rechecks its own last reply |
+| `hooks/pre-commit` | Git hook that scores staged .md and .txt files |
+| `tests/` | unittest suite |
 
 ## Quick start
 
@@ -139,5 +181,22 @@ The pre-commit hook scores staged `.md` and `.txt` files with the same max. Copy
 
 It flags shapes, and a flagged sentence can still be the one you meant to keep on the page. It reads English only, so a draft in another language will not be scored in a useful way. The score is a prompt to reread the lines it marked, and the number is there so you look again rather than treat the run as a grade.
 
-Made by Lucas Cooper-Bey as Door 29 of 100 Doors, one free tool a day: https://sandiegoaistudio.com/season
-If you like comparing how other people edit their AI drafts, San Diego AI Studio runs Sharathon, where builders show their own setups: https://www.skool.com/sandiegoaistudio
+## Part of 100 Doors
+
+This is the gift behind **Door 29** of [100 Doors](https://github.com/LucasCooperBey/100-doors), where I open up the things I've built with AI, one door at a time.
+
+- The door and every other door: [the 100 Doors index](https://github.com/LucasCooperBey/100-doors)
+- Related door: [the breakdown skill](https://github.com/LucasCooperBey/claude-skills/tree/main/skills/breakdown) (Door 22) puts one plain sentence first
+- The season: [sandiegoaistudio.com/season](https://sandiegoaistudio.com/season)
+
+### Come see it live
+
+If you want to see how this and the rest of the doors open up into my software factory, come to [Sharathon](https://sandiegoaistudio.com/sharathon), San Diego AI Studio's show-your-setup day. Sharathon 3 is Sunday, Nov 15 in La Mesa: [RSVP on Luma](https://luma.com/5y5ju7ud).
+
+## Credits
+
+- Built by [Lucas Cooper-Bey](https://github.com/LucasCooperBey) from the checks his own drafts go through
+
+## License
+
+MIT, see [LICENSE](LICENSE).
